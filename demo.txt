@@ -1,0 +1,285 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
+
+#define INPUT_CAP 2048
+#define STAGE_CAP 32
+#define WORD_CAP 64
+
+typedef struct {
+    char *words[WORD_CAP];
+    char *read_from;
+    char *write_to;
+    int word_count;
+} Stage;
+
+static void remove_newline(char *text)
+{
+    text[strcspn(text, "\n")] = '\0';
+}
+
+static char *trim_space(char *text)
+{
+    while (*text == ' ' || *text == '\t')
+        text++;
+
+    size_t n = strlen(text);
+    while (n > 0 && (text[n - 1] == ' ' || text[n - 1] == '\t'))
+        text[--n] = '\0';
+
+    return text;
+}
+
+static int parse_stage(char *text, Stage *stage)
+{
+    char *save = NULL;
+    char *part;
+
+    memset(stage, 0, sizeof(*stage));
+    part = strtok_r(text, " \t", &save);
+
+    while (part != NULL) {
+        if (strcmp(part, "<") == 0 || strcmp(part, ">") == 0) {
+            int is_input = (part[0] == '<');
+            char *filename = strtok_r(NULL, " \t", &save);
+
+            if (filename == NULL || strcmp(filename, "<") == 0 ||
+                strcmp(filename, ">") == 0) {
+                fprintf(stderr, "syntax error: redirection needs a filename\n");
+                return -1;
+            }
+
+            if (is_input) {
+                if (stage->read_from != NULL) {
+                    fprintf(stderr, "syntax error: repeated input redirection\n");
+                    return -1;
+                }
+                stage->read_from = filename;
+            } else {
+                if (stage->write_to != NULL) {
+                    fprintf(stderr, "syntax error: repeated output redirection\n");
+                    return -1;
+                }
+                stage->write_to = filename;
+            }
+        } else {
+            if (stage->word_count >= WORD_CAP - 1) {
+                fprintf(stderr, "too many arguments in command\n");
+                return -1;
+            }
+            stage->words[stage->word_count++] = part;
+        }
+
+        part = strtok_r(NULL, " \t", &save);
+    }
+
+    stage->words[stage->word_count] = NULL;
+
+    if (stage->word_count == 0) {
+        fprintf(stderr, "syntax error: empty command\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int parse_pipeline(char *line, Stage stages[])
+{
+    int total = 0;
+    char *cursor = line;
+
+    while (1) {
+        char *separator = strchr(cursor, '|');
+
+        if (separator != NULL)
+            *separator = '\0';
+
+        if (total == STAGE_CAP) {
+            fprintf(stderr, "too many commands in pipeline\n");
+            return -1;
+        }
+
+        char *piece = trim_space(cursor);
+        if (*piece == '\0') {
+            fprintf(stderr, "syntax error: missing command around pipe\n");
+            return -1;
+        }
+
+        if (parse_stage(piece, &stages[total]) != 0)
+            return -1;
+
+        total++;
+
+        if (separator == NULL)
+            break;
+
+        cursor = separator + 1;
+    }
+
+    return total;
+}
+
+static int redirect_descriptor(const char *filename, int target, int flags)
+{
+    int descriptor = open(filename, flags, 0644);
+
+    if (descriptor == -1) {
+        perror(filename);
+        return -1;
+    }
+
+    if (dup2(descriptor, target) == -1) {
+        perror("dup2");
+        close(descriptor);
+        return -1;
+    }
+
+    close(descriptor);
+    return 0;
+}
+
+static void run_child(Stage *stage, int position, int count, int links[][2])
+{
+    if (position > 0 && dup2(links[position - 1][0], STDIN_FILENO) == -1) {
+        perror("dup2");
+        _exit(1);
+    }
+
+    if (position + 1 < count &&
+        dup2(links[position][1], STDOUT_FILENO) == -1) {
+        perror("dup2");
+        _exit(1);
+    }
+
+    for (int k = 0; k < count - 1; k++) {
+        close(links[k][0]);
+        close(links[k][1]);
+    }
+
+    if (stage->read_from != NULL &&
+        redirect_descriptor(stage->read_from, STDIN_FILENO, O_RDONLY) == -1)
+        _exit(1);
+
+    if (stage->write_to != NULL &&
+        redirect_descriptor(stage->write_to, STDOUT_FILENO,
+                            O_WRONLY | O_CREAT | O_TRUNC) == -1)
+        _exit(1);
+
+    execvp(stage->words[0], stage->words);
+    fprintf(stderr, "%s: %s\n", stage->words[0], strerror(errno));
+    _exit(127);
+}
+
+static void execute_pipeline(Stage stages[], int count)
+{
+    int channels[STAGE_CAP - 1][2];
+    pid_t children[STAGE_CAP];
+    int made = 0;
+
+    for (int k = 0; k < count - 1; k++) {
+        if (pipe(channels[k]) == -1) {
+            perror("pipe");
+            for (int j = 0; j < made; j++) {
+                close(channels[j][0]);
+                close(channels[j][1]);
+            }
+            return;
+        }
+        made++;
+    }
+
+    int launched = 0;
+    for (int k = 0; k < count; k++) {
+        pid_t child = fork();
+
+        if (child == -1) {
+            perror("fork");
+            break;
+        }
+
+        if (child == 0)
+            run_child(&stages[k], k, count, channels);
+
+        children[launched++] = child;
+    }
+
+    for (int k = 0; k < count - 1; k++) {
+        close(channels[k][0]);
+        close(channels[k][1]);
+    }
+
+    for (int k = 0; k < launched; k++) {
+        int status;
+        while (waitpid(children[k], &status, 0) == -1 && errno == EINTR)
+            ;
+    }
+}
+
+static int handle_builtin(Stage *stage, int count)
+{
+    if (count != 1)
+        return 0;
+
+    char **args = stage->words;
+
+    if (strcmp(args[0], "exit") == 0)
+        exit(EXIT_SUCCESS);
+
+    if (strcmp(args[0], "cd") == 0) {
+        if (args[1] == NULL) {
+            fprintf(stderr, "cd: missing directory\n");
+        } else if (args[2] != NULL) {
+            fprintf(stderr, "cd: too many arguments\n");
+        } else if (chdir(args[1]) == -1) {
+            perror("cd");
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+int main(void)
+{
+    char buffer[INPUT_CAP];
+
+    for (;;) {
+        Stage stages[STAGE_CAP];
+
+        fputs("myshell> ", stdout);
+        fflush(stdout);
+
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+            putchar('\n');
+            break;
+        }
+
+        remove_newline(buffer);
+        char *line = trim_space(buffer);
+
+        if (*line == '\0')
+            continue;
+
+        if (strncmp(line, "PATH=", 5) == 0) {
+            if (setenv("PATH", line + 5, 1) == -1)
+                perror("setenv");
+            continue;
+        }
+
+        int count = parse_pipeline(line, stages);
+        if (count < 0)
+            continue;
+
+        if (handle_builtin(stages, count))
+            continue;
+
+        execute_pipeline(stages, count);
+    }
+
+    return 0;
+}
